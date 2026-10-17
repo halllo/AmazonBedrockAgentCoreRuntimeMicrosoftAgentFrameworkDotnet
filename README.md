@@ -28,7 +28,8 @@ Experimental: a Microsoft Agent Framework agent hosted in Amazon Bedrock AgentCo
 
 - `AgentRuntime` – the agent (Bedrock LLM, `GetCurrentDate` tool). Container image for AgentCore (`Dockerfile`, linux/arm64, port 8080).
 - `AgentManagement` – registers the runtime in AgentCore and spawns sessions.
-- `Aspire` – starts both locally.
+- `AgentManagementUi` – Angular UI for AgentManagement: sessions, chat, AG-UI event log.
+- `Aspire` – the AppHost; starts all of the above locally.
 
 ## Run
 
@@ -39,7 +40,13 @@ cd ..
 dotnet run --project Aspire
 ```
 
-AgentRuntime: <http://localhost:8080> · AgentManagement: <http://localhost:5080> (both redirect to Scalar in Development).
+The Aspire dashboard lists the resources and their links:
+
+| Resource | URL | |
+| --- | --- | --- |
+| `agent-runtime` | <http://localhost:8080> | the agent, run locally (Scalar) |
+| `agent-management` | <http://localhost:5080> | sessions in AgentCore (Scalar) |
+| `agent-management-ui` | <http://localhost:4200> | the UI; Aspire runs `npm install` first and starts it once `agent-management` is up |
 
 ## AgentRuntime
 
@@ -63,6 +70,14 @@ On first use it looks up the runtime `AgentRuntime:Name`. It creates the runtime
 - `DELETE /sessions/{id}` – stop the session
 
 Config: `AgentRuntime:ContainerUri` and `AgentRuntime:RoleArn` (both required), plus `NetworkMode`, `EnvironmentVariables`, `IdleSessionTimeout` (15 min) and `MaxSessionLifetime` (8 h). Config changes are picked up without a restart.
+
+## AgentManagementUi
+
+Angular app, started by Aspire as `agent-management-ui`. It lists sessions (`GET /sessions`), starts new ones, and chats through `POST /sessions/{id}/agui`. Each AG-UI event is shown raw next to the chat.
+
+The dev server proxies `/api/*` to AgentManagement (`proxy.conf.mjs`), so no CORS is needed. Aspire's reference to `agent-management` supplies the target URL.
+
+The transcript is kept in the browser's memory only. After a reload the agent still remembers the conversation, but the UI shows only new messages. A new session shows up in `GET /sessions` only after its first prompt.
 
 ## Deploy to AgentCore
 
