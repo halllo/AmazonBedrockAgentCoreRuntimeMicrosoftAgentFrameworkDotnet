@@ -21,6 +21,12 @@ public sealed class AgentRuntimeOptions
 
     public Dictionary<string, string> EnvironmentVariables { get; set; } = [];
 
+    /// <summary>Idle time after which AgentCore stops a session (AgentCore default: 15 min).</summary>
+    public TimeSpan IdleSessionTimeout { get; set; } = TimeSpan.FromMinutes(15);
+
+    /// <summary>Lifetime after which AgentCore stops a session regardless of activity (AgentCore default: 8 h).</summary>
+    public TimeSpan MaxSessionLifetime { get; set; } = TimeSpan.FromHours(8);
+
     public TimeSpan ReadyTimeout { get; set; } = TimeSpan.FromMinutes(10);
 }
 
@@ -29,16 +35,29 @@ public sealed record RegisteredAgentRuntime(string Id, string Arn, string Versio
 /// <summary>
 /// Registers the AgentCore Runtime on first use: creates it when no runtime with the configured name
 /// exists, updates it when the configuration differs, and otherwise reuses it as is.
+/// A configuration change (e.g. a new ContainerUri in user secrets) drops the cached registration,
+/// so the next request rolls the change out without restarting the app.
 /// </summary>
-public sealed class AgentRuntimeRegistry(
-    IAmazonBedrockAgentCoreControl control,
-    IOptions<AgentRuntimeOptions> options,
-    ILogger<AgentRuntimeRegistry> logger)
+public sealed class AgentRuntimeRegistry
 {
     private static readonly TimeSpan PollInterval = TimeSpan.FromSeconds(5);
 
+    private readonly IAmazonBedrockAgentCoreControl control;
+    private readonly IOptionsMonitor<AgentRuntimeOptions> options;
+    private readonly ILogger<AgentRuntimeRegistry> logger;
     private readonly SemaphoreSlim _lock = new(1, 1);
     private RegisteredAgentRuntime? _runtime;
+
+    public AgentRuntimeRegistry(
+        IAmazonBedrockAgentCoreControl control,
+        IOptionsMonitor<AgentRuntimeOptions> options,
+        ILogger<AgentRuntimeRegistry> logger)
+    {
+        this.control = control;
+        this.options = options;
+        this.logger = logger;
+        options.OnChange(_ => _runtime = null);
+    }
 
     public async Task<RegisteredAgentRuntime> GetOrRegisterAsync(CancellationToken ct)
     {
@@ -50,7 +69,7 @@ public sealed class AgentRuntimeRegistry(
         await _lock.WaitAsync(ct);
         try
         {
-            return _runtime ??= await RegisterAsync(options.Value, ct);
+            return _runtime ??= await RegisterAsync(options.CurrentValue, ct);
         }
         finally
         {
@@ -80,6 +99,7 @@ public sealed class AgentRuntimeRegistry(
                     NetworkConfiguration = Network(desired),
                     ProtocolConfiguration = Protocol(),
                     EnvironmentVariables = desired.EnvironmentVariables,
+                    LifecycleConfiguration = Lifecycle(desired),
                     ClientToken = Guid.NewGuid().ToString(),
                 }, ct);
                 return await WaitUntilReadyAsync(created.AgentRuntimeId, desired.ReadyTimeout, ct);
@@ -110,6 +130,7 @@ public sealed class AgentRuntimeRegistry(
             NetworkConfiguration = Network(desired),
             ProtocolConfiguration = Protocol(),
             EnvironmentVariables = desired.EnvironmentVariables,
+            LifecycleConfiguration = Lifecycle(desired),
             ClientToken = Guid.NewGuid().ToString(),
         }, ct);
         return await WaitUntilReadyAsync(current.AgentRuntimeId, desired.ReadyTimeout, ct);
@@ -142,6 +163,8 @@ public sealed class AgentRuntimeRegistry(
             || (current.Description ?? "") != (desired.Description ?? "")
             || current.NetworkConfiguration?.NetworkMode?.Value != desired.NetworkMode
             || current.ProtocolConfiguration?.ServerProtocol != ServerProtocol.HTTP
+            || current.LifecycleConfiguration?.IdleRuntimeSessionTimeout != (int)desired.IdleSessionTimeout.TotalSeconds
+            || current.LifecycleConfiguration?.MaxLifetime != (int)desired.MaxSessionLifetime.TotalSeconds
             || currentEnv.Count != desired.EnvironmentVariables.Count
             || desired.EnvironmentVariables.Any(kv => !currentEnv.TryGetValue(kv.Key, out var v) || v != kv.Value);
     }
@@ -180,6 +203,12 @@ public sealed class AgentRuntimeRegistry(
 
     private static AgentRuntimeArtifact Artifact(AgentRuntimeOptions o) =>
         new() { ContainerConfiguration = new ContainerConfiguration { ContainerUri = o.ContainerUri } };
+
+    private static LifecycleConfiguration Lifecycle(AgentRuntimeOptions o) => new()
+    {
+        IdleRuntimeSessionTimeout = (int)o.IdleSessionTimeout.TotalSeconds,
+        MaxLifetime = (int)o.MaxSessionLifetime.TotalSeconds,
+    };
 
     private static NetworkConfiguration Network(AgentRuntimeOptions o) =>
         new() { NetworkMode = new NetworkMode(o.NetworkMode) };

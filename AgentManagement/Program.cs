@@ -25,6 +25,8 @@ builder.Services.AddAWSService<IAmazonBedrockAgentCore>();
 
 builder.Services.Configure<AgentRuntimeOptions>(builder.Configuration.GetSection("AgentRuntime"));
 builder.Services.AddSingleton<AgentRuntimeRegistry>();
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.AddSingleton<SessionTracker>();
 builder.Services.AddOpenApi();
 
 var app = builder.Build();
@@ -41,12 +43,17 @@ if (app.Environment.IsDevelopment())
 app.MapGet("/runtime", (AgentRuntimeRegistry registry, CancellationToken ct) =>
     registry.GetOrRegisterAsync(ct));
 
+// Sessions invoked through this instance that AgentCore has not yet stopped (estimated from the
+// runtime's idle timeout and max lifetime; AgentCore has no API to list runtime sessions).
+app.MapGet("/sessions", (SessionTracker sessions) => sessions.GetActive());
+
 // Spawns a new agent session. AgentCore starts the session's microVM on its first invocation,
 // so an optional initial prompt is sent right away; without one only the session id is allocated.
 app.MapPost("/sessions", async (
     CreateSessionRequest? request,
     AgentRuntimeRegistry registry,
     IAmazonBedrockAgentCore agentCore,
+    SessionTracker sessions,
     CancellationToken ct) =>
 {
     var runtime = await registry.GetOrRegisterAsync(ct);
@@ -57,6 +64,7 @@ app.MapPost("/sessions", async (
         return Results.Created($"/sessions/{sessionId}", new SessionResponse(sessionId, null));
     }
 
+    sessions.Touch(sessionId, runtime.Version);
     var response = await InvokeAsync(agentCore, runtime, sessionId, request.Prompt, ct);
     return Results.Created($"/sessions/{sessionId}", new SessionResponse(sessionId, response));
 });
@@ -67,6 +75,7 @@ app.MapPost("/sessions/{sessionId}/invocations", async (
     PromptRequest request,
     AgentRuntimeRegistry registry,
     IAmazonBedrockAgentCore agentCore,
+    SessionTracker sessions,
     CancellationToken ct) =>
 {
     if (string.IsNullOrWhiteSpace(request.Prompt))
@@ -80,6 +89,7 @@ app.MapPost("/sessions/{sessionId}/invocations", async (
     }
 
     var runtime = await registry.GetOrRegisterAsync(ct);
+    sessions.Touch(sessionId, runtime.Version);
     var response = await InvokeAsync(agentCore, runtime, sessionId, request.Prompt, ct);
     return Results.Ok(new SessionResponse(sessionId, response));
 });
@@ -90,6 +100,7 @@ app.MapPost("/sessions/{sessionId}/agui", async (
     HttpContext http,
     AgentRuntimeRegistry registry,
     IAmazonBedrockAgentCore agentCore,
+    SessionTracker sessions,
     CancellationToken ct) =>
 {
     if (!IsValidSessionId(sessionId))
@@ -99,6 +110,7 @@ app.MapPost("/sessions/{sessionId}/agui", async (
     }
 
     var runtime = await registry.GetOrRegisterAsync(ct);
+    sessions.Touch(sessionId, runtime.Version);
 
     var payload = new MemoryStream();
     await http.Request.Body.CopyToAsync(payload, ct);
@@ -133,6 +145,7 @@ app.MapDelete("/sessions/{sessionId}", async (
     string sessionId,
     AgentRuntimeRegistry registry,
     IAmazonBedrockAgentCore agentCore,
+    SessionTracker sessions,
     CancellationToken ct) =>
 {
     var runtime = await registry.GetOrRegisterAsync(ct);
@@ -147,9 +160,11 @@ app.MapDelete("/sessions/{sessionId}", async (
     }
     catch (Amazon.BedrockAgentCore.Model.ResourceNotFoundException)
     {
+        sessions.Remove(sessionId);
         return Results.NotFound();
     }
 
+    sessions.Remove(sessionId);
     return Results.NoContent();
 });
 
